@@ -1,57 +1,64 @@
 /*
- ============================================================
-                     ROAD MESH
-                  FINAL DEMO VERSION
- ============================================================
+============================================================
+                    ROAD MESH FINAL
+============================================================
 
- Hardware:
-   - ESP32-C5 OR NodeMCU ESP32
-   - SX1278 / RA-02 433 MHz
-   - MPU6050
-   - GPS
+Boards:
+    - NodeMCU ESP32
+    - ESP32-C5
 
- Features:
-   - Accident detection
-   - Very sensitive demo trigger
-   - GPS
-   - MPU6050 acceleration + gyro
-   - LoRa mesh
-   - Packet TTL
-   - Duplicate protection
-   - Heartbeat / node discovery
-   - Active node count
-   - RSSI / SNR
-   - WiFi dashboard
+Communication:
+    - SX1278 / RA-02 LoRa 433 MHz
+    - BLE optional transport
 
- ============================================================
+Sensors:
+    - MPU6050
+    - GPS
+
+WiFi:
+    - RoadMesh Access Point
+    - Captive portal
+    - Live web dashboard
+
+Features:
+    - Local accident detection
+    - Remote accident detection
+    - LoRa node discovery
+    - LoRa packet forwarding
+    - TTL
+    - Duplicate filtering
+    - BLE accident broadcast
+    - BLE accident reception
+    - GPS
+    - MPU6050
+    - Live dashboard
+    - Transport selection
+
+IMPORTANT:
+    This is a demonstration/research system.
+    The accident threshold is deliberately sensitive.
+    It is NOT a production crash-detection algorithm.
+============================================================
 */
 
 
 // ============================================================
-// BOARD CONFIGURATION
+//                    BOARD CONFIGURATION
 // ============================================================
 
-// -------- ESP32-C5 --------
+// ESP32-C5:
+// #define BOARD_C5
+// #define NODE_ID 1
 
-#define BOARD_C5
-#define NODE_ID 1
-
-
-// -------- NODEMCU ESP32 --------
-//
-// For NodeMCU:
-// Comment the two lines above and use:
-//
+// NodeMCU ESP32:
 // #define NODE_ID 2
-//
-// Example:
-//
-// // #define BOARD_C5
-// #define NODE_ID 2
+
+//#define BOARD_C5
+#define NODE_ID 2
 
 
 // ============================================================
-// LIBRARIES
+//                    LIBRARIES
 // ============================================================
 
 #include <Arduino.h>
@@ -59,27 +66,60 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
+
 #include <LoRa.h>
 #include <TinyGPSPlus.h>
 
+// IMPORTANT:
+// This is the BLE library from the ESP32 Arduino core.
+// DO NOT install/use NimBLE-Arduino separately.
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <BLEAdvertising.h>
+
 
 // ============================================================
-// WIFI
+//                    WIFI
 // ============================================================
 
-const char* WIFI_NAME = "RoadMesh";
+const char* WIFI_NAME = "RoadMesh2";
 const char* WIFI_PASSWORD = "roadmesh123";
 
 WebServer server(80);
 
+DNSServer dnsServer;
+
+const byte DNS_PORT = 53;
+
 
 // ============================================================
-// PIN CONFIGURATION
+//                    TRANSPORT
+// ============================================================
+
+enum TransportMode {
+
+  MODE_LORA,
+
+  MODE_BLE
+};
+
+TransportMode transport =
+  MODE_LORA;
+
+
+// ============================================================
+//                    PIN CONFIGURATION
 // ============================================================
 
 #ifdef BOARD_C5
 
-// ---------------- ESP32-C5 ----------------
+// ------------------------------------------------------------
+// ESP32-C5
+// ------------------------------------------------------------
 
 #define MPU_SDA 4
 #define MPU_SCL 5
@@ -87,7 +127,7 @@ WebServer server(80);
 #define GPS_RX 24
 #define GPS_TX 23
 
-#define LORA_SCK  6
+#define LORA_SCK  7
 #define LORA_MISO 8
 #define LORA_MOSI 9
 #define LORA_SS   10
@@ -96,7 +136,9 @@ WebServer server(80);
 
 #else
 
-// ---------------- CLASSIC ESP32 ----------------
+// ------------------------------------------------------------
+// NodeMCU ESP32
+// ------------------------------------------------------------
 
 #define MPU_SDA 21
 #define MPU_SCL 22
@@ -108,28 +150,60 @@ WebServer server(80);
 #define LORA_MISO 19
 #define LORA_MOSI 23
 #define LORA_SS   5
-#define LORA_RST  14
+#define LORA_RST 14
 #define LORA_DIO0 26
 
 #endif
 
 
 // ============================================================
-// GPS
+//                    LORA CONFIGURATION
 // ============================================================
 
-#define GPS_BAUD 115200
+#define LORA_FREQUENCY 433E6
 
-HardwareSerial GPSSerial(1);
+#define LORA_SF 7
 
-TinyGPSPlus gps;
+#define LORA_BW 125E3
+
+#define LORA_CR 5
+
+#define LORA_POWER 17
 
 
 // ============================================================
-// MPU6050
+//                    MESH CONFIGURATION
 // ============================================================
 
-#define MPU_ADDR 0x68
+#define MESH_TTL 3
+
+#define MAX_NODES 20
+
+#define NODE_TIMEOUT 10000
+
+#define HEARTBEAT_INTERVAL 3000
+
+#define PACKET_HISTORY_SIZE 50
+
+
+// ============================================================
+//                    ACCIDENT CONFIG
+// ============================================================
+
+// Sensitive demo mode.
+
+#define ACCIDENT_THRESHOLD 50
+
+#define ACCIDENT_COOLDOWN 15000
+
+
+// ============================================================
+//                    MPU6050
+// ============================================================
+
+#define MPU_ADDRESS 0x68
+
+bool mpuOK = false;
 
 float ax = 0;
 float ay = 0;
@@ -144,85 +218,53 @@ float gravityY = 0;
 float gravityZ = 0;
 
 float dynamicAcceleration = 0;
+
 float gyroMagnitude = 0;
 
 
 // ============================================================
-// GPS VARIABLES
+//                    GPS
 // ============================================================
 
-double latitude = 0;
-double longitude = 0;
+HardwareSerial GPSSerial(1);
 
-int satellites = 0;
+TinyGPSPlus gps;
 
 bool gpsFix = false;
 
+double latitude = 0;
+
+double longitude = 0;
+
+uint32_t satellites = 0;
+
 
 // ============================================================
-// ACCIDENT DETECTION
+//                    ACCIDENT STATE
 // ============================================================
 
 float crashConfidence = 0;
 
-bool accidentDetected = false;
+bool localAccident = false;
+
+bool remoteAccident = false;
+
+uint16_t remoteNode = 0;
+
+float remoteConfidence = 0;
+
+unsigned long remoteAlertTime = 0;
 
 unsigned long lastAccidentTime = 0;
 
-#define ACCIDENT_COOLDOWN 15000
-
 
 // ============================================================
-// MESH CONFIGURATION
+//                    NETWORK STATISTICS
 // ============================================================
 
-#define MESH_TTL 3
+uint32_t packetsTX = 0;
 
-#define PACKET_HISTORY_SIZE 40
-
-uint32_t sequenceNumber = 0;
-
-struct SeenPacket {
-
-  uint16_t origin;
-
-  uint32_t sequence;
-};
-
-SeenPacket packetHistory[PACKET_HISTORY_SIZE];
-
-int historyIndex = 0;
-
-
-// ============================================================
-// NODE DISCOVERY
-// ============================================================
-
-#define MAX_NODES 20
-
-#define NODE_TIMEOUT 10000
-
-#define HEARTBEAT_INTERVAL 3000
-
-struct KnownNode {
-
-  uint16_t id;
-
-  unsigned long lastSeen;
-
-  int rssi;
-};
-
-KnownNode knownNodes[MAX_NODES];
-
-unsigned long lastHeartbeat = 0;
-
-
-// ============================================================
-// MESH STATISTICS
-// ============================================================
-
-uint32_t packetsReceived = 0;
+uint32_t packetsRX = 0;
 
 uint32_t packetsForwarded = 0;
 
@@ -232,13 +274,95 @@ int lastRSSI = 0;
 
 float lastSNR = 0;
 
-String lastReceived = "None";
+String lastTX = "None";
 
-String lastSent = "None";
+String lastRX = "None";
 
 
 // ============================================================
-// MPU INITIALIZATION
+//                    NODE TABLE
+// ============================================================
+
+struct NodeInfo {
+
+  uint16_t id;
+
+  unsigned long lastSeen;
+
+  int rssi;
+};
+
+NodeInfo nodes[MAX_NODES];
+
+
+// ============================================================
+//                    PACKET HISTORY
+// ============================================================
+
+struct PacketHistory {
+
+  uint16_t node;
+
+  uint32_t sequence;
+};
+
+PacketHistory packetHistory[
+  PACKET_HISTORY_SIZE
+];
+
+int historyIndex = 0;
+
+
+// ============================================================
+//                    SEQUENCE
+// ============================================================
+
+uint32_t sequenceNumber = 1;
+
+
+// ============================================================
+//                    TIMERS
+// ============================================================
+
+unsigned long lastSensorRead = 0;
+
+unsigned long lastHeartbeat = 0;
+
+unsigned long lastBLEScan = 0;
+
+
+// ============================================================
+//                    BLE
+// ============================================================
+
+BLEScan* bleScan = nullptr;
+
+BLEAdvertising* bleAdvertising = nullptr;
+
+
+// ============================================================
+//                    MPU I2C WRITE
+// ============================================================
+
+void mpuWrite(
+  uint8_t reg,
+  uint8_t value
+) {
+
+  Wire.beginTransmission(
+    MPU_ADDRESS
+  );
+
+  Wire.write(reg);
+
+  Wire.write(value);
+
+  Wire.endTransmission();
+}
+
+
+// ============================================================
+//                    MPU INIT
 // ============================================================
 
 bool initMPU() {
@@ -248,16 +372,16 @@ bool initMPU() {
     MPU_SCL
   );
 
+  delay(100);
+
+
   Wire.beginTransmission(
-    MPU_ADDR
+    MPU_ADDRESS
   );
-
-  Wire.write(0x6B);
-
-  Wire.write(0x00);
 
   byte error =
     Wire.endTransmission();
+
 
   if (error != 0) {
 
@@ -268,64 +392,79 @@ bool initMPU() {
     return false;
   }
 
-  delay(100);
+
+  mpuWrite(
+    0x6B,
+    0x00
+  );
 
 
   // Accelerometer ±2g
 
-  Wire.beginTransmission(
-    MPU_ADDR
+  mpuWrite(
+    0x1C,
+    0x00
   );
 
-  Wire.write(0x1C);
 
-  Wire.write(0x00);
+  // Gyroscope ±250°/s
 
-  Wire.endTransmission();
-
-
-  // Gyroscope ±250 degrees/sec
-
-  Wire.beginTransmission(
-    MPU_ADDR
+  mpuWrite(
+    0x1B,
+    0x00
   );
 
-  Wire.write(0x1B);
 
-  Wire.write(0x00);
-
-  Wire.endTransmission();
+  delay(100);
 
 
   Serial.println(
     "MPU6050 OK"
   );
 
+
   return true;
 }
 
 
 // ============================================================
-// READ MPU6050
+//                    MPU READ
 // ============================================================
 
 void readMPU() {
 
+  if (!mpuOK) {
+
+    return;
+  }
+
+
   Wire.beginTransmission(
-    MPU_ADDR
+    MPU_ADDRESS
   );
 
-  Wire.write(0x3B);
-
-  Wire.endTransmission(false);
-
-  Wire.requestFrom(
-    MPU_ADDR,
-    14
+  Wire.write(
+    0x3B
   );
 
   if (
-    Wire.available() < 14
+    Wire.endTransmission(false)
+    != 0
+  ) {
+
+    return;
+  }
+
+
+  Wire.requestFrom(
+    MPU_ADDRESS,
+    14
+  );
+
+
+  if (
+    Wire.available()
+    < 14
   ) {
 
     return;
@@ -333,15 +472,20 @@ void readMPU() {
 
 
   int16_t rawAx =
-    (Wire.read() << 8) |
+    ((int16_t)Wire.read() << 8)
+    |
     Wire.read();
+
 
   int16_t rawAy =
-    (Wire.read() << 8) |
+    ((int16_t)Wire.read() << 8)
+    |
     Wire.read();
 
+
   int16_t rawAz =
-    (Wire.read() << 8) |
+    ((int16_t)Wire.read() << 8)
+    |
     Wire.read();
 
 
@@ -352,15 +496,20 @@ void readMPU() {
 
 
   int16_t rawGx =
-    (Wire.read() << 8) |
+    ((int16_t)Wire.read() << 8)
+    |
     Wire.read();
+
 
   int16_t rawGy =
-    (Wire.read() << 8) |
+    ((int16_t)Wire.read() << 8)
+    |
     Wire.read();
 
+
   int16_t rawGz =
-    (Wire.read() << 8) |
+    ((int16_t)Wire.read() << 8)
+    |
     Wire.read();
 
 
@@ -372,9 +521,11 @@ void readMPU() {
     rawAx / 16384.0 *
     9.80665;
 
+
   ay =
     rawAy / 16384.0 *
     9.80665;
+
 
   az =
     rawAz / 16384.0 *
@@ -388,42 +539,48 @@ void readMPU() {
   gx =
     rawGx / 131.0;
 
+
   gy =
     rawGy / 131.0;
+
 
   gz =
     rawGz / 131.0;
 
 
   // ----------------------------------------------------------
-  // LOW-PASS GRAVITY ESTIMATION
+  // REMOVE GRAVITY
   // ----------------------------------------------------------
 
-  const float alpha = 0.98;
+  const float alpha =
+    0.98;
 
 
   gravityX =
-    alpha * gravityX +
+    alpha * gravityX
+    +
     (1.0 - alpha) * ax;
 
+
   gravityY =
-    alpha * gravityY +
+    alpha * gravityY
+    +
     (1.0 - alpha) * ay;
 
+
   gravityZ =
-    alpha * gravityZ +
+    alpha * gravityZ
+    +
     (1.0 - alpha) * az;
 
-
-  // ----------------------------------------------------------
-  // REMOVE GRAVITY
-  // ----------------------------------------------------------
 
   float dx =
     ax - gravityX;
 
+
   float dy =
     ay - gravityY;
+
 
   float dz =
     az - gravityZ;
@@ -437,10 +594,6 @@ void readMPU() {
     );
 
 
-  // ----------------------------------------------------------
-  // GYROSCOPE MAGNITUDE
-  // ----------------------------------------------------------
-
   gyroMagnitude =
     sqrt(
       gx * gx +
@@ -451,7 +604,7 @@ void readMPU() {
 
 
 // ============================================================
-// GPS
+//                    GPS
 // ============================================================
 
 void readGPS() {
@@ -479,6 +632,10 @@ void readGPS() {
       gps.location.lng();
 
   }
+  else {
+
+    gpsFix = false;
+  }
 
 
   if (
@@ -492,72 +649,7 @@ void readGPS() {
 
 
 // ============================================================
-// PACKET HISTORY
-// ============================================================
-
-bool packetAlreadySeen(
-  uint16_t origin,
-  uint32_t sequence
-) {
-
-  for (
-    int i = 0;
-    i < PACKET_HISTORY_SIZE;
-    i++
-  ) {
-
-    if (
-      packetHistory[i].origin ==
-      origin &&
-
-      packetHistory[i].sequence ==
-      sequence
-    ) {
-
-      return true;
-    }
-  }
-
-  return false;
-}
-
-
-// ============================================================
-// REMEMBER PACKET
-// ============================================================
-
-void rememberPacket(
-  uint16_t origin,
-  uint32_t sequence
-) {
-
-  packetHistory[
-    historyIndex
-  ].origin =
-    origin;
-
-
-  packetHistory[
-    historyIndex
-  ].sequence =
-    sequence;
-
-
-  historyIndex++;
-
-
-  if (
-    historyIndex >=
-    PACKET_HISTORY_SIZE
-  ) {
-
-    historyIndex = 0;
-  }
-}
-
-
-// ============================================================
-// REGISTER NODE
+//                    NODE REGISTER
 // ============================================================
 
 void registerNode(
@@ -573,7 +665,7 @@ void registerNode(
   }
 
 
-  // Already known
+  // Existing node
 
   for (
     int i = 0;
@@ -582,14 +674,13 @@ void registerNode(
   ) {
 
     if (
-      knownNodes[i].id ==
-      id
+      nodes[i].id == id
     ) {
 
-      knownNodes[i].lastSeen =
+      nodes[i].lastSeen =
         millis();
 
-      knownNodes[i].rssi =
+      nodes[i].rssi =
         rssi;
 
       return;
@@ -597,7 +688,7 @@ void registerNode(
   }
 
 
-  // Find empty slot
+  // New node
 
   for (
     int i = 0;
@@ -606,27 +697,27 @@ void registerNode(
   ) {
 
     if (
-      knownNodes[i].id ==
-      0
+      nodes[i].id == 0
     ) {
 
-      knownNodes[i].id =
+      nodes[i].id =
         id;
 
-      knownNodes[i].lastSeen =
+      nodes[i].lastSeen =
         millis();
 
-      knownNodes[i].rssi =
+      nodes[i].rssi =
         rssi;
 
 
       Serial.print(
-        "NEW NODE DETECTED: "
+        "NEW NODE: "
       );
 
       Serial.println(
         id
       );
+
 
       return;
     }
@@ -635,12 +726,13 @@ void registerNode(
 
 
 // ============================================================
-// COUNT ACTIVE NODES
+//                    ACTIVE NODES
 // ============================================================
 
-int getActiveNodeCount() {
+int activeNodeCount() {
 
   int count = 1;
+
 
   for (
     int i = 0;
@@ -649,10 +741,10 @@ int getActiveNodeCount() {
   ) {
 
     if (
-      knownNodes[i].id != 0 &&
-
+      nodes[i].id != 0
+      &&
       millis() -
-      knownNodes[i].lastSeen
+      nodes[i].lastSeen
       <
       NODE_TIMEOUT
     ) {
@@ -661,16 +753,86 @@ int getActiveNodeCount() {
     }
   }
 
+
   return count;
 }
 
 
 // ============================================================
-// SEND LORA
+//                    PACKET HISTORY
+// ============================================================
+
+bool packetSeen(
+  uint16_t node,
+  uint32_t sequence
+) {
+
+  for (
+    int i = 0;
+    i < PACKET_HISTORY_SIZE;
+    i++
+  ) {
+
+    if (
+      packetHistory[i].node
+      ==
+      node
+      &&
+      packetHistory[i].sequence
+      ==
+      sequence
+    ) {
+
+      return true;
+    }
+  }
+
+
+  return false;
+}
+
+
+// ============================================================
+//                    REMEMBER PACKET
+// ============================================================
+
+void rememberPacket(
+  uint16_t node,
+  uint32_t sequence
+) {
+
+  packetHistory[
+    historyIndex
+  ].node =
+    node;
+
+
+  packetHistory[
+    historyIndex
+  ].sequence =
+    sequence;
+
+
+  historyIndex++;
+
+
+  if (
+    historyIndex
+    >=
+    PACKET_HISTORY_SIZE
+  ) {
+
+    historyIndex = 0;
+  }
+}
+
+
+// ============================================================
+//                    LORA SEND
 // ============================================================
 
 void sendLoRa(
-  const String &packet
+  const String& packet
 ) {
 
   LoRa.idle();
@@ -678,28 +840,671 @@ void sendLoRa(
 
   LoRa.beginPacket();
 
-
   LoRa.print(
     packet
   );
 
+  int result =
+    LoRa.endPacket();
 
-  LoRa.endPacket();
+
+  if (
+    result == 1
+  ) {
+
+    packetsTX++;
+
+    lastTX =
+      packet;
+  }
 
 
   LoRa.receive();
-
-
-  lastSent =
-    packet;
 }
 
 
 // ============================================================
-// SEND HEARTBEAT
+//                    BLE CALLBACK
+// ============================================================
+
+class RoadMeshBLECallbacks
+  : public BLEAdvertisedDeviceCallbacks {
+
+public:
+
+  void onResult(
+    BLEAdvertisedDevice advertisedDevice
+  ) override {
+
+    String data = "";
+
+
+    if (
+    advertisedDevice.haveManufacturerData()
+    ) {
+
+    data =
+    advertisedDevice.getManufacturerData();
+    }
+
+
+    if (
+      data.length() == 0
+    ) {
+
+      return;
+    }
+
+
+    Serial.print(
+      "BLE RX: "
+    );
+
+    Serial.println(
+      data
+    );
+
+
+    // --------------------------------------------------------
+    // FORMAT:
+    //
+    // RM,A,NODE,SEQ,CONF
+    // --------------------------------------------------------
+
+    if (
+      !data.startsWith(
+        "RM,A,"
+      )
+    ) {
+
+      return;
+    }
+
+
+    int p1 =
+      data.indexOf(
+        ',',
+        5
+      );
+
+
+    int p2 =
+      data.indexOf(
+        ',',
+        p1 + 1
+      );
+
+
+    if (
+      p1 < 0
+      ||
+      p2 < 0
+    ) {
+
+      return;
+    }
+
+
+    uint16_t origin =
+      data.substring(
+        5,
+        p1
+      ).toInt();
+
+
+    uint32_t sequence =
+      data.substring(
+        p1 + 1,
+        p2
+      ).toInt();
+
+
+    float confidence =
+      data.substring(
+        p2 + 1
+      ).toFloat();
+
+
+    if (
+      origin == NODE_ID
+    ) {
+
+      return;
+    }
+
+
+    if (
+      packetSeen(
+        origin,
+        sequence
+      )
+    ) {
+
+      return;
+    }
+
+
+    rememberPacket(
+      origin,
+      sequence
+    );
+
+
+    registerNode(
+      origin,
+      advertisedDevice.getRSSI()
+    );
+
+
+    packetsRX++;
+
+
+    lastRSSI =
+      advertisedDevice.getRSSI();
+
+
+    lastSNR =
+      0;
+
+
+    lastRX =
+      data;
+
+
+    remoteAccident =
+      true;
+
+
+    remoteNode =
+      origin;
+
+
+    remoteConfidence =
+      confidence;
+
+
+    remoteAlertTime =
+      millis();
+
+
+    Serial.println();
+    Serial.println(
+      "================================"
+    );
+
+    Serial.println(
+      "🚨 BLE REMOTE ACCIDENT"
+    );
+
+    Serial.print(
+      "Node: "
+    );
+
+    Serial.println(
+      origin
+    );
+
+    Serial.print(
+      "Confidence: "
+    );
+
+    Serial.println(
+      confidence
+    );
+
+    Serial.println(
+      "================================"
+    );
+  }
+};
+
+
+// ============================================================
+//                    BLE INIT
+// ============================================================
+
+void initBLE() {
+
+  Serial.println(
+    "Starting BLE..."
+  );
+
+
+  if (
+    !BLEDevice::init(
+      "RoadMesh"
+    )
+  ) {
+
+    Serial.println(
+      "BLE INIT FAILED"
+    );
+
+    return;
+  }
+
+
+  bleScan =
+    BLEDevice::getScan();
+
+
+  if (
+    bleScan != nullptr
+  ) {
+
+    bleScan->setAdvertisedDeviceCallbacks(
+      new RoadMeshBLECallbacks()
+    );
+
+
+    bleScan->setActiveScan(
+      true
+    );
+
+
+    bleScan->setInterval(
+      100
+    );
+
+
+    bleScan->setWindow(
+      80
+    );
+  }
+
+
+  bleAdvertising =
+    BLEDevice::getAdvertising();
+
+
+  Serial.println(
+    "BLE READY"
+  );
+}
+
+
+// ============================================================
+//                    BLE SEND
+// ============================================================
+
+void sendBLEAccident() {
+
+  if (
+    bleAdvertising == nullptr
+  ) {
+
+    return;
+  }
+
+
+  uint32_t sequence =
+    sequenceNumber++;
+
+
+  rememberPacket(
+    NODE_ID,
+    sequence
+  );
+
+
+  String data =
+    "RM,A,";
+
+
+  data +=
+    String(
+      NODE_ID
+    );
+
+
+  data +=
+    ",";
+
+
+  data +=
+    String(
+      sequence
+    );
+
+
+  data +=
+    ",";
+
+
+  data +=
+    String(
+      crashConfidence,
+      0
+    );
+
+
+  Serial.print(
+    "BLE TX: "
+  );
+
+  Serial.println(
+    data
+  );
+
+
+  BLEAdvertisementData advertisementData;
+
+
+  advertisementData.setManufacturerData(
+    data.c_str()
+  );
+
+
+  bleAdvertising->stop();
+
+
+  bleAdvertising->setAdvertisementData(
+    advertisementData
+  );
+
+
+  bleAdvertising->start();
+
+
+  packetsTX++;
+
+
+  lastTX =
+    data;
+}
+
+
+// ============================================================
+//                    BLE SCAN
+// ============================================================
+
+void scanBLE() {
+
+  if (
+    bleScan == nullptr
+  ) {
+
+    return;
+  }
+
+
+  Serial.println(
+    "BLE scanning..."
+  );
+
+
+  bleScan->start(
+    2,
+    false
+  );
+
+
+  bleScan->clearResults();
+}
+
+
+// ============================================================
+//                    LORA ACCIDENT PACKET
+// ============================================================
+
+String createAccidentPacket() {
+
+  uint32_t sequence =
+    sequenceNumber++;
+
+
+  rememberPacket(
+    NODE_ID,
+    sequence
+  );
+
+
+  String packet =
+    "RM|A|";
+
+
+  packet +=
+    String(
+      NODE_ID
+    );
+
+
+  packet +=
+    "|";
+
+
+  packet +=
+    String(
+      sequence
+    );
+
+
+  packet +=
+    "|";
+
+
+  packet +=
+    String(
+      MESH_TTL
+    );
+
+
+  packet +=
+    "|";
+
+
+  packet +=
+    String(
+      latitude,
+      6
+    );
+
+
+  packet +=
+    "|";
+
+
+  packet +=
+    String(
+      longitude,
+      6
+    );
+
+
+  packet +=
+    "|";
+
+
+  packet +=
+    String(
+      crashConfidence,
+      0
+    );
+
+
+  packet +=
+    "|";
+
+
+  packet +=
+    String(
+      dynamicAcceleration,
+      2
+    );
+
+
+  return packet;
+}
+
+
+// ============================================================
+//                    SEND ACCIDENT
+// ============================================================
+
+void sendAccident() {
+
+  Serial.println();
+  Serial.println(
+    "🚨 LOCAL ACCIDENT DETECTED"
+  );
+
+
+  if (
+    transport
+    ==
+    MODE_LORA
+  ) {
+
+    String packet =
+      createAccidentPacket();
+
+
+    Serial.print(
+      "LORA TX: "
+    );
+
+    Serial.println(
+      packet
+    );
+
+
+    sendLoRa(
+      packet
+    );
+  }
+
+
+  else {
+
+    sendBLEAccident();
+  }
+}
+
+
+// ============================================================
+//                    ACCIDENT DETECTION
+// ============================================================
+
+void detectAccident() {
+
+  float score = 0;
+
+
+  // ----------------------------------------------------------
+  // Dynamic acceleration
+  // ----------------------------------------------------------
+
+  if (
+    dynamicAcceleration
+    >=
+    1.2
+  ) {
+
+    score += 45;
+  }
+
+  else if (
+    dynamicAcceleration
+    >=
+    0.6
+  ) {
+
+    score += 25;
+  }
+
+
+  // ----------------------------------------------------------
+  // Rotation
+  // ----------------------------------------------------------
+
+  if (
+    gyroMagnitude
+    >=
+    35
+  ) {
+
+    score += 35;
+  }
+
+  else if (
+    gyroMagnitude
+    >=
+    15
+  ) {
+
+    score += 20;
+  }
+
+
+  // ----------------------------------------------------------
+  // Combined movement
+  // ----------------------------------------------------------
+
+  if (
+    dynamicAcceleration
+    >=
+    0.8
+    &&
+    gyroMagnitude
+    >=
+    20
+  ) {
+
+    score += 25;
+  }
+
+
+  if (
+    score > 100
+  ) {
+
+    score = 100;
+  }
+
+
+  crashConfidence =
+    score;
+
+
+  if (
+    crashConfidence
+    >=
+    ACCIDENT_THRESHOLD
+    &&
+    millis() -
+    lastAccidentTime
+    >
+    ACCIDENT_COOLDOWN
+  ) {
+
+    localAccident =
+      true;
+
+
+    lastAccidentTime =
+      millis();
+
+
+    sendAccident();
+  }
+}
+
+
+// ============================================================
+//                    HEARTBEAT
 // ============================================================
 
 void sendHeartbeat() {
+
+  if (
+    transport
+    !=
+    MODE_LORA
+  ) {
+
+    return;
+  }
+
 
   String packet =
     "RM|H|";
@@ -724,361 +1529,11 @@ void sendHeartbeat() {
   sendLoRa(
     packet
   );
-
-
-  Serial.print(
-    "HEARTBEAT: "
-  );
-
-  Serial.println(
-    packet
-  );
 }
 
 
 // ============================================================
-// SEND ACCIDENT
-// ============================================================
-
-void sendAccident() {
-
-  uint32_t sequence =
-    sequenceNumber++;
-
-
-  rememberPacket(
-    NODE_ID,
-    sequence
-  );
-
-
-  String packet =
-    "RM|A|";
-
-
-  packet +=
-    String(
-      NODE_ID
-    );
-
-
-  packet += "|";
-
-
-  packet +=
-    String(
-      sequence
-    );
-
-
-  packet += "|";
-
-
-  packet +=
-    String(
-      MESH_TTL
-    );
-
-
-  packet += "|";
-
-
-  packet +=
-    String(
-      latitude,
-      6
-    );
-
-
-  packet += "|";
-
-
-  packet +=
-    String(
-      longitude,
-      6
-    );
-
-
-  packet += "|";
-
-
-  packet +=
-    String(
-      crashConfidence,
-      0
-    );
-
-
-  packet += "|";
-
-
-  packet +=
-    String(
-      dynamicAcceleration,
-      2
-    );
-
-
-  Serial.println();
-  Serial.println(
-    "=============================="
-  );
-
-  Serial.println(
-    "🚨 ACCIDENT DETECTED"
-  );
-
-  Serial.println(
-    packet
-  );
-
-  Serial.println(
-    "=============================="
-  );
-
-
-  sendLoRa(
-    packet
-  );
-}
-
-
-// ============================================================
-// DEMO ACCIDENT DETECTION
-// ============================================================
-
-void calculateCrashConfidence() {
-
-  float score = 0;
-
-
-  /*
-    ----------------------------------------------------------
-    VERY SENSITIVE DEMO THRESHOLDS
-
-    These intentionally trigger from small movement.
-
-    Production values MUST be much higher and should be
-    determined from actual vehicle data.
-    ----------------------------------------------------------
-  */
-
-
-  // Dynamic acceleration
-
-  if (
-    dynamicAcceleration >= 1.2
-  ) {
-
-    score += 45;
-
-  }
-
-  else if (
-    dynamicAcceleration >= 0.6
-  ) {
-
-    score += 25;
-  }
-
-
-  // Rotation
-
-  if (
-    gyroMagnitude >= 35
-  ) {
-
-    score += 35;
-
-  }
-
-  else if (
-    gyroMagnitude >= 15
-  ) {
-
-    score += 20;
-  }
-
-
-  // Combined movement
-
-  if (
-    dynamicAcceleration >= 0.8 &&
-    gyroMagnitude >= 20
-  ) {
-
-    score += 25;
-  }
-
-
-  if (
-    score > 100
-  ) {
-
-    score = 100;
-  }
-
-
-  crashConfidence =
-    score;
-
-
-  // Trigger
-
-  if (
-    crashConfidence >= 50 &&
-
-    millis() -
-    lastAccidentTime
-    >
-    ACCIDENT_COOLDOWN
-  ) {
-
-    accidentDetected =
-      true;
-
-
-    lastAccidentTime =
-      millis();
-
-
-    sendAccident();
-  }
-}
-
-
-// ============================================================
-// FORWARD ACCIDENT PACKET
-// ============================================================
-
-void forwardPacket(
-  String packet,
-  int ttl
-) {
-
-  if (
-    ttl <= 0
-  ) {
-
-    packetsDropped++;
-
-    return;
-  }
-
-
-  int newTTL =
-    ttl - 1;
-
-
-  /*
-    Packet:
-
-    RM|A|NODE|SEQ|TTL|LAT|LON|CONF|ACC
-  */
-
-
-  int p1 =
-    packet.indexOf(
-      '|',
-      5
-    );
-
-
-  int p2 =
-    packet.indexOf(
-      '|',
-      p1 + 1
-    );
-
-
-  if (
-    p1 < 0 ||
-    p2 < 0
-  ) {
-
-    packetsDropped++;
-
-    return;
-  }
-
-
-  String newPacket =
-    packet.substring(
-      0,
-      p2 + 1
-    );
-
-
-  newPacket +=
-    String(
-      newTTL
-    );
-
-
-  int ttlEnd =
-    packet.indexOf(
-      '|',
-      p2 + 1
-    );
-
-
-  if (
-    ttlEnd < 0
-  ) {
-
-    packetsDropped++;
-
-    return;
-  }
-
-
-  newPacket +=
-    packet.substring(
-      ttlEnd
-    );
-
-
-  // Random jitter reduces collisions
-
-  randomSeed(
-    micros() +
-    NODE_ID
-  );
-
-
-  int waitTime =
-    random(
-      80,
-      300
-    );
-
-
-  delay(
-    waitTime
-  );
-
-
-  sendLoRa(
-    newPacket
-  );
-
-
-  packetsForwarded++;
-
-
-  Serial.println(
-    "PACKET FORWARDED"
-  );
-
-  Serial.println(
-    newPacket
-  );
-}
-
-
-// ============================================================
-// RECEIVE LORA
+//                    LORA RECEIVE
 // ============================================================
 
 void receiveLoRa() {
@@ -1109,6 +1564,9 @@ void receiveLoRa() {
   }
 
 
+  packetsRX++;
+
+
   lastRSSI =
     LoRa.packetRssi();
 
@@ -1117,50 +1575,66 @@ void receiveLoRa() {
     LoRa.packetSnr();
 
 
-  lastReceived =
+  lastRX =
     packet;
-
-
-  packetsReceived++;
 
 
   Serial.println();
   Serial.println(
-    "------------------------------"
-  );
-
-  Serial.println(
-    "RECEIVED:"
+    "LORA RX:"
   );
 
   Serial.println(
     packet
   );
 
-  Serial.print(
-    "RSSI: "
-  );
 
-  Serial.println(
-    lastRSSI
-  );
+  // ----------------------------------------------------------
+  // HEARTBEAT
+  // ----------------------------------------------------------
 
-  Serial.print(
-    "SNR: "
-  );
+  if (
+    packet.startsWith(
+      "RM|H|"
+    )
+  ) {
 
-  Serial.println(
-    lastSNR
-  );
+    int separator =
+      packet.indexOf(
+        '|',
+        5
+      );
 
 
-  // =========================================================
-  // VALIDATE
-  // =========================================================
+    if (
+      separator > 0
+    ) {
+
+      uint16_t id =
+        packet.substring(
+          5,
+          separator
+        ).toInt();
+
+
+      registerNode(
+        id,
+        lastRSSI
+      );
+    }
+
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // ACCIDENT
+  // ----------------------------------------------------------
 
   if (
     !packet.startsWith(
-      "RM|"
+      "RM|A|"
     )
   ) {
 
@@ -1170,466 +1644,230 @@ void receiveLoRa() {
   }
 
 
-  // =========================================================
-  // HEARTBEAT
-  // =========================================================
+  int p1 =
+    packet.indexOf(
+      '|',
+      5
+    );
+
+
+  int p2 =
+    packet.indexOf(
+      '|',
+      p1 + 1
+    );
+
+
+  int p3 =
+    packet.indexOf(
+      '|',
+      p2 + 1
+    );
+
 
   if (
-    packet.startsWith(
-      "RM|H|"
-    )
+    p1 < 0
+    ||
+    p2 < 0
+    ||
+    p3 < 0
   ) {
 
-    int p1 =
-      packet.indexOf(
-        '|',
-        5
-      );
-
-
-    if (
-      p1 > 0
-    ) {
-
-      uint16_t remoteNode =
-        packet.substring(
-          5,
-          p1
-        ).toInt();
-
-
-      registerNode(
-        remoteNode,
-        lastRSSI
-      );
-
-
-      Serial.print(
-        "HEARD NODE: "
-      );
-
-      Serial.println(
-        remoteNode
-      );
-    }
-
+    packetsDropped++;
 
     return;
   }
 
 
-  // =========================================================
-  // ACCIDENT
-  // =========================================================
+  uint16_t origin =
+    packet.substring(
+      5,
+      p1
+    ).toInt();
+
+
+  uint32_t sequence =
+    packet.substring(
+      p1 + 1,
+      p2
+    ).toInt();
+
+
+  int ttl =
+    packet.substring(
+      p2 + 1,
+      p3
+    ).toInt();
+
+
+  // Duplicate
 
   if (
-    packet.startsWith(
-      "RM|A|"
+    packetSeen(
+      origin,
+      sequence
     )
   ) {
 
-    /*
-      RM|A|ORIGIN|SEQ|TTL|LAT|LON|CONF|ACC
-    */
+    packetsDropped++;
+
+    return;
+  }
 
 
-    int p1 =
-      packet.indexOf(
-        '|',
-        5
-      );
+  rememberPacket(
+    origin,
+    sequence
+  );
 
 
-    int p2 =
-      packet.indexOf(
-        '|',
-        p1 + 1
-      );
+  registerNode(
+    origin,
+    lastRSSI
+  );
 
 
-    int p3 =
-      packet.indexOf(
-        '|',
-        p2 + 1
+  // ----------------------------------------------------------
+  // Confidence
+  // ----------------------------------------------------------
+
+  int last =
+    packet.lastIndexOf(
+      '|'
+    );
+
+
+  int secondLast =
+    packet.lastIndexOf(
+      '|',
+      last - 1
+    );
+
+
+  if (
+    secondLast >= 0
+  ) {
+
+    remoteConfidence =
+      packet.substring(
+        secondLast + 1,
+        last
+      ).toFloat();
+  }
+
+
+  // ----------------------------------------------------------
+  // REMOTE ALERT
+  // ----------------------------------------------------------
+
+  remoteAccident =
+    true;
+
+
+  remoteNode =
+    origin;
+
+
+  remoteAlertTime =
+    millis();
+
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "🚨 REMOTE ACCIDENT DETECTED"
+  );
+
+  Serial.print(
+    "Origin node: "
+  );
+
+  Serial.println(
+    origin
+  );
+
+  Serial.print(
+    "Confidence: "
+  );
+
+  Serial.println(
+    remoteConfidence
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+
+  // ----------------------------------------------------------
+  // FORWARD
+  // ----------------------------------------------------------
+
+  if (
+    ttl > 0
+  ) {
+
+    // Rebuild packet with TTL - 1
+
+    String forwarded =
+      packet;
+
+
+    String ttlString =
+      "|" +
+      String(ttl) +
+      "|";
+
+
+    String newTTL =
+      "|" +
+      String(ttl - 1) +
+      "|";
+
+
+    int pos =
+      forwarded.indexOf(
+        ttlString
       );
 
 
     if (
-      p1 < 0 ||
-      p2 < 0 ||
-      p3 < 0
+      pos >= 0
     ) {
 
-      packetsDropped++;
-
-      return;
-    }
-
-
-    uint16_t origin =
-      packet.substring(
-        5,
-        p1
-      ).toInt();
-
-
-    uint32_t sequence =
-      packet.substring(
-        p1 + 1,
-        p2
-      ).toInt();
-
-
-    int ttl =
-      packet.substring(
-        p2 + 1,
-        p3
-      ).toInt();
-
-
-    // -------------------------------------------------------
-    // DUPLICATE PROTECTION
-    // -------------------------------------------------------
-
-    if (
-      packetAlreadySeen(
-        origin,
-        sequence
-      )
-    ) {
-
-      packetsDropped++;
-
-      Serial.println(
-        "DUPLICATE PACKET - DROPPED"
+      forwarded.replace(
+        ttlString,
+        newTTL
       );
 
-      return;
+
+      delay(
+        random(
+          50,
+          250
+        )
+      );
+
+
+      sendLoRa(
+        forwarded
+      );
+
+
+      packetsForwarded++;
     }
-
-
-    rememberPacket(
-      origin,
-      sequence
-    );
-
-
-    // -------------------------------------------------------
-    // REGISTER ORIGIN NODE
-    // -------------------------------------------------------
-
-    registerNode(
-      origin,
-      lastRSSI
-    );
-
-
-    // -------------------------------------------------------
-    // REMOTE ALERT
-    // -------------------------------------------------------
-
-    Serial.println();
-    Serial.println(
-      "!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    );
-
-    Serial.println(
-      "🚨 REMOTE ACCIDENT ALERT"
-    );
-
-    Serial.print(
-      "Origin Node: "
-    );
-
-    Serial.println(
-      origin
-    );
-
-    Serial.print(
-      "Sequence: "
-    );
-
-    Serial.println(
-      sequence
-    );
-
-    Serial.print(
-      "RSSI: "
-    );
-
-    Serial.println(
-      lastRSSI
-    );
-
-    Serial.print(
-      "SNR: "
-    );
-
-    Serial.println(
-      lastSNR
-    );
-
-    Serial.println(
-      "!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    );
-
-
-    // -------------------------------------------------------
-    // FORWARD
-    // -------------------------------------------------------
-
-    forwardPacket(
-      packet,
-      ttl
-    );
   }
 }
 
 
 // ============================================================
-// WEB API
+//                    WEB PAGE
 // ============================================================
 
-void handleData() {
-
-  String json =
-    "{";
-
-
-  json +=
-    "\"node\":";
-
-  json +=
-    String(
-      NODE_ID
-    );
-
-
-  json +=
-    ",\"gps\":";
-
-  json +=
-    gpsFix
-      ? "true"
-      : "false";
-
-
-  json +=
-    ",\"lat\":";
-
-  json +=
-    String(
-      latitude,
-      6
-    );
-
-
-  json +=
-    ",\"lon\":";
-
-  json +=
-    String(
-      longitude,
-      6
-    );
-
-
-  json +=
-    ",\"sat\":";
-
-  json +=
-    String(
-      satellites
-    );
-
-
-  json +=
-    ",\"ax\":";
-
-  json +=
-    String(
-      ax,
-      2
-    );
-
-
-  json +=
-    ",\"ay\":";
-
-  json +=
-    String(
-      ay,
-      2
-    );
-
-
-  json +=
-    ",\"az\":";
-
-  json +=
-    String(
-      az,
-      2
-    );
-
-
-  json +=
-    ",\"dynamic\":";
-
-  json +=
-    String(
-      dynamicAcceleration,
-      2
-    );
-
-
-  json +=
-    ",\"gyro\":";
-
-  json +=
-    String(
-      gyroMagnitude,
-      1
-    );
-
-
-  json +=
-    ",\"confidence\":";
-
-  json +=
-    String(
-      crashConfidence,
-      0
-    );
-
-
-  json +=
-    ",\"accident\":";
-
-  json +=
-    accidentDetected
-      ? "true"
-      : "false";
-
-
-  json +=
-    ",\"nodes\":";
-
-  json +=
-    String(
-      getActiveNodeCount()
-    );
-
-
-  json +=
-    ",\"rx\":";
-
-  json +=
-    String(
-      packetsReceived
-    );
-
-
-  json +=
-    ",\"forwarded\":";
-
-  json +=
-    String(
-      packetsForwarded
-    );
-
-
-  json +=
-    ",\"dropped\":";
-
-  json +=
-    String(
-      packetsDropped
-    );
-
-
-  json +=
-    ",\"rssi\":";
-
-  json +=
-    String(
-      lastRSSI
-    );
-
-
-  json +=
-    ",\"snr\":";
-
-  json +=
-    String(
-      lastSNR,
-      1
-    );
-
-
-  // ----------------------------------------------------------
-  // LAST RECEIVED
-  // ----------------------------------------------------------
-
-  String received =
-    lastReceived;
-
-  received.replace(
-    "\"",
-    "\\\""
-  );
-
-
-  json +=
-    ",\"received\":\"";
-
-  json +=
-    received;
-
-  json +=
-    "\"";
-
-
-  // ----------------------------------------------------------
-  // LAST SENT
-  // ----------------------------------------------------------
-
-  String sent =
-    lastSent;
-
-  sent.replace(
-    "\"",
-    "\\\""
-  );
-
-
-  json +=
-    ",\"sent\":\"";
-
-  json +=
-    sent;
-
-  json +=
-    "\"";
-
-
-  json +=
-    "}";
-
-
-  server.send(
-    200,
-    "application/json",
-    json
-  );
-}
-
-
-// ============================================================
-// WEB PAGE
-// ============================================================
-
-const char PAGE[] PROGMEM = R"rawliteral(
+const char MAIN_PAGE[] PROGMEM = R"rawliteral(
 
 <!DOCTYPE html>
 
@@ -1644,155 +1882,158 @@ content="width=device-width,initial-scale=1">
 
 <style>
 
-body {
+*{
+box-sizing:border-box;
+}
 
-font-family:
-Arial,
-sans-serif;
+body{
 
-background:
-#0f172a;
+margin:0;
 
-color:
-white;
+padding:16px;
 
-margin:
-0;
+font-family:Arial,sans-serif;
 
-padding:
-20px;
+background:#0f172a;
+
+color:#fff;
 
 }
 
-.container {
+.container{
 
-max-width:
-1100px;
+max-width:1100px;
 
-margin:
-auto;
+margin:auto;
 
 }
 
-h1 {
+h1{
 
-margin-bottom:
-4px;
-
-}
-
-.subtitle {
-
-color:
-#94a3b8;
-
-margin-top:
-0;
+margin-bottom:4px;
 
 }
 
-.grid {
+.subtitle{
 
-display:
-grid;
+color:#94a3b8;
+
+}
+
+.grid{
+
+display:grid;
 
 grid-template-columns:
 repeat(
 auto-fit,
 minmax(
-220px,
+210px,
 1fr
 )
 );
 
-gap:
-15px;
+gap:12px;
 
 }
 
-.card {
+.card{
 
-background:
-#1e293b;
+background:#1e293b;
 
-padding:
-20px;
+padding:18px;
 
-border-radius:
-14px;
+border-radius:14px;
 
-margin-bottom:
-15px;
+margin-bottom:12px;
 
 }
 
-.label {
+.label{
 
-color:
-#94a3b8;
+font-size:12px;
 
-font-size:
-14px;
+color:#94a3b8;
 
-}
-
-.value {
-
-font-size:
-28px;
-
-font-weight:
-bold;
+text-transform:uppercase;
 
 }
 
-.normal {
+.value{
 
-color:
-#22c55e;
+font-size:27px;
 
-}
+font-weight:bold;
 
-.warning {
-
-color:
-#facc15;
+margin-top:8px;
 
 }
 
-.danger {
+.green{
 
-color:
-#ef4444;
+color:#22c55e;
+}
+
+.yellow{
+
+color:#facc15;
+}
+
+.red{
+
+color:#ef4444;
+}
+
+.blue{
+
+color:#38bdf8;
+}
+
+button{
+
+border:0;
+
+padding:12px 18px;
+
+margin:4px;
+
+border-radius:9px;
+
+font-size:15px;
+
+cursor:pointer;
 
 }
 
-.blue {
+.alert{
 
-color:
-#38bdf8;
+display:none;
+
+background:#7f1d1d;
+
+border:2px solid #ef4444;
+
+padding:20px;
+
+border-radius:14px;
+
+margin-bottom:15px;
 
 }
 
-.packet {
+.packet{
 
-background:
-#020617;
+font-family:monospace;
 
-padding:
-12px;
+background:#020617;
 
-border-radius:
-8px;
+padding:12px;
 
-font-family:
-monospace;
+border-radius:8px;
 
-font-size:
-12px;
+word-break:break-all;
 
-word-break:
-break-all;
+font-size:12px;
 
 }
 
@@ -1808,21 +2049,67 @@ break-all;
 
 <h1>🚗 RoadMesh</h1>
 
-<p class="subtitle">
-Cooperative Vehicle Safety Network
+<div class="subtitle">
+Cooperative Accident Alert Network
+</div>
+
+
+<br>
+
+
+<div id="remoteAlert"
+class="alert">
+
+<h2>
+🚨 REMOTE ACCIDENT DETECTED
+</h2>
+
+<p>
+Origin Node:
+<b id="remoteNode">--</b>
 </p>
+
+<p>
+Confidence:
+<b id="remoteConfidence">--</b>%
+</p>
+
+<p>
+Another RoadMesh node has reported an accident.
+</p>
+
+</div>
+
+
+<div class="card">
+
+<div class="label">
+Communication Transport
+</div>
+
+<h2 id="transport">
+LoRa
+</h2>
+
+<button onclick="setTransport('LORA')">
+📡 LoRa
+</button>
+
+<button onclick="setTransport('BLE')">
+🔵 Bluetooth
+</button>
+
+</div>
 
 
 <div class="grid">
 
 
-<!-- NODE -->
-
 <div class="card">
 
-<p class="label">
-NODE ID
-</p>
+<div class="label">
+Node ID
+</div>
 
 <div
 class="value blue"
@@ -1833,13 +2120,11 @@ id="node">
 </div>
 
 
-<!-- ACTIVE NODES -->
-
 <div class="card">
 
-<p class="label">
-ACTIVE MESH NODES
-</p>
+<div class="label">
+Active Nodes
+</div>
 
 <div
 class="value blue"
@@ -1847,20 +2132,14 @@ id="nodes">
 --
 </div>
 
-<p class="label">
-Recently heard nodes
-</p>
-
 </div>
 
 
-<!-- GPS -->
-
 <div class="card">
 
-<p class="label">
-GPS STATUS
-</p>
+<div class="label">
+GPS
+</div>
 
 <div
 class="value"
@@ -1870,35 +2149,27 @@ id="gps">
 
 <p>
 Latitude:
-<span id="lat">
---
-</span>
+<span id="lat">--</span>
 </p>
 
 <p>
 Longitude:
-<span id="lon">
---
-</span>
+<span id="lon">--</span>
 </p>
 
 <p>
 Satellites:
-<span id="sat">
---
-</span>
+<span id="sat">--</span>
 </p>
 
 </div>
 
 
-<!-- ACCELERATION -->
-
 <div class="card">
 
-<p class="label">
-DYNAMIC ACCELERATION
-</p>
+<div class="label">
+Acceleration
+</div>
 
 <div
 class="value blue"
@@ -1908,21 +2179,18 @@ id="dynamic">
 
 <p>
 Gyroscope:
-<span id="gyro">
---
-</span>
+<span id="gyro">--</span>
+°/s
 </p>
 
 </div>
 
 
-<!-- ACCIDENT -->
-
 <div class="card">
 
-<p class="label">
-CRASH CONFIDENCE
-</p>
+<div class="label">
+Crash Confidence
+</div>
 
 <div
 class="value"
@@ -1930,68 +2198,63 @@ id="confidence">
 --
 </div>
 
-<p id="accident">
+<p id="localStatus">
 Normal
 </p>
 
 </div>
 
 
-<!-- MESH -->
-
 <div class="card">
 
-<p class="label">
-MESH NETWORK
+<div class="label">
+Network
+
+Statistics
+</div>
+
+<p>
+RX:
+<span id="rx">--</span>
 </p>
 
 <p>
-Received:
-<span id="rx">
---
-</span>
+TX:
+<span id="tx">--</span>
 </p>
 
 <p>
 Forwarded:
-<span id="forwarded">
---
-</span>
+<span id="forwarded">--</span>
 </p>
 
 <p>
 Dropped:
-<span id="dropped">
---
-</span>
+<span id="dropped">--</span>
 </p>
 
 <p>
 RSSI:
-<span id="rssi">
---
-</span>
+<span id="rssi">--</span>
+dBm
 </p>
 
 <p>
 SNR:
-<span id="snr">
---
-</span>
+<span id="snr">--</span>
+dB
 </p>
 
 </div>
 
 </div>
 
-
-<!-- RECEIVED -->
 
 <div class="card">
 
-<p class="label">
-LAST RECEIVED PACKET
-</p>
+<div class="label">
+Last Received
+</div>
 
 <div
 class="packet"
@@ -2002,13 +2265,11 @@ None
 </div>
 
 
-<!-- SENT -->
-
 <div class="card">
 
-<p class="label">
-LAST SENT PACKET
-</p>
+<div class="label">
+Last Sent
+</div>
 
 <div
 class="packet"
@@ -2025,62 +2286,79 @@ None
 <script>
 
 
-async function updateData() {
+async function setTransport(mode){
 
-try {
+try{
 
-
-const response =
 await fetch(
-"/data"
+"/transport?mode="+mode
 );
 
+update();
 
-const data =
+}
+
+catch(e){
+
+console.log(e);
+
+}
+
+}
+
+
+async function update(){
+
+try{
+
+const response =
+await fetch("/data");
+
+const d =
 await response.json();
 
 
 document.getElementById(
 "node"
 ).innerHTML =
-data.node;
+d.node;
 
 
 document.getElementById(
 "nodes"
 ).innerHTML =
-data.nodes;
+d.nodes;
 
 
-// ======================================================
+document.getElementById(
+"transport"
+).innerHTML =
+d.transport;
+
+
 // GPS
-// ======================================================
 
 const gps =
-document.getElementById(
-"gps"
-);
+document.getElementById("gps");
 
 
-if (
-data.gps
-) {
+if(d.gps){
 
 gps.innerHTML =
 "● FIX";
 
 gps.className =
-"value normal";
+"value green";
 
 }
 
-else {
+else{
 
 gps.innerHTML =
 "● NO FIX";
 
 gps.className =
-"value warning";
+"value yellow";
 
 }
 
@@ -2088,166 +2366,182 @@ gps.className =
 document.getElementById(
 "lat"
 ).innerHTML =
-data.lat;
+d.lat;
 
 
 document.getElementById(
 "lon"
 ).innerHTML =
-data.lon;
+d.lon;
 
 
 document.getElementById(
 "sat"
 ).innerHTML =
-data.sat;
+d.sat;
 
 
-// ======================================================
-// MPU
-// ======================================================
+// SENSOR
 
 document.getElementById(
 "dynamic"
 ).innerHTML =
-data.dynamic +
-" m/s²";
+d.dynamic+" m/s²";
 
 
 document.getElementById(
 "gyro"
 ).innerHTML =
-data.gyro +
-" °/s";
+d.gyro;
 
 
-// ======================================================
-// ACCIDENT
-// ======================================================
+// CONFIDENCE
 
 const confidence =
 document.getElementById(
 "confidence"
 );
 
-const accident =
+
+confidence.innerHTML =
+d.confidence+"%";
+
+
+const local =
 document.getElementById(
-"accident"
+"localStatus"
 );
 
 
-confidence.innerHTML =
-data.confidence +
-"%";
+if(d.local){
 
+local.innerHTML =
+"🚨 LOCAL ACCIDENT DETECTED";
 
-if (
-data.accident
-) {
-
-accident.innerHTML =
-"🚨 ACCIDENT DETECTED";
-
-accident.className =
-"danger";
+local.className =
+"red";
 
 confidence.className =
-"value danger";
+"value red";
 
 }
 
-else {
+else{
 
-accident.innerHTML =
+local.innerHTML =
 "✓ Normal";
 
-accident.className =
-"normal";
+local.className =
+"green";
 
 confidence.className =
-"value normal";
+"value green";
 
 }
 
 
-// ======================================================
-// MESH
-// ======================================================
+// REMOTE
+
+const remote =
+document.getElementById(
+"remoteAlert"
+);
+
+
+if(d.remote){
+
+remote.style.display =
+"block";
+
+document.getElementById(
+"remoteNode"
+).innerHTML =
+d.remoteNode;
+
+document.getElementById(
+"remoteConfidence"
+).innerHTML =
+d.remoteConfidence;
+
+}
+
+else{
+
+remote.style.display =
+"none";
+
+}
+
+
+// STATS
 
 document.getElementById(
 "rx"
 ).innerHTML =
-data.rx;
+d.rx;
+
+
+document.getElementById(
+"tx"
+).innerHTML =
+d.tx;
 
 
 document.getElementById(
 "forwarded"
 ).innerHTML =
-data.forwarded;
+d.forwarded;
 
 
 document.getElementById(
 "dropped"
 ).innerHTML =
-data.dropped;
+d.dropped;
 
 
 document.getElementById(
 "rssi"
 ).innerHTML =
-data.rssi +
-" dBm";
+d.rssi;
 
 
 document.getElementById(
 "snr"
 ).innerHTML =
-data.snr +
-" dB";
+d.snr;
 
-
-// ======================================================
-// PACKETS
-// ======================================================
 
 document.getElementById(
 "received"
 ).innerHTML =
-data.received;
+d.received;
 
 
 document.getElementById(
 "sent"
 ).innerHTML =
-data.sent;
-
+d.sent;
 
 }
 
-catch (
-error
-) {
+catch(e){
 
-console.log(
-"Dashboard error:",
-error
-);
+console.log(e);
 
 }
 
 }
 
 
-updateData();
-
+update();
 
 setInterval(
-updateData,
+update,
 500
 );
 
-
 </script>
+
 
 </body>
 
@@ -2257,7 +2551,7 @@ updateData,
 
 
 // ============================================================
-// WEB SERVER
+//                    WEB ROOT
 // ============================================================
 
 void handleRoot() {
@@ -2265,104 +2559,487 @@ void handleRoot() {
   server.send_P(
     200,
     "text/html",
-    PAGE
+    MAIN_PAGE
   );
 }
 
 
 // ============================================================
-// SETUP
+//                    WEB DATA
 // ============================================================
 
-void setup() {
+void handleData() {
 
-  Serial.begin(
-    115200
-  );
-
-
-  delay(
-    1500
-  );
+  String json =
+    "{";
 
 
-  Serial.println();
-
-  Serial.println(
-    "========================================"
-  );
-
-  Serial.println(
-    "          ROAD MESH STARTING"
-  );
-
-  Serial.println(
-    "========================================"
-  );
+  json +=
+    "\"node\":" +
+    String(NODE_ID);
 
 
-  Serial.print(
-    "NODE ID: "
-  );
+  json +=
+    ",\"transport\":\"";
 
-  Serial.println(
-    NODE_ID
-  );
-
-
-#ifdef BOARD_C5
-
-  Serial.println(
-    "BOARD: ESP32-C5"
-  );
-
-#else
-
-  Serial.println(
-    "BOARD: CLASSIC ESP32"
-  );
-
-#endif
-
-
-  // =========================================================
-  // MPU
-  // =========================================================
 
   if (
-    !initMPU()
+    transport == MODE_LORA
   ) {
 
+    json +=
+      "LoRa";
+
+  }
+
+  else {
+
+    json +=
+      "BLE";
+  }
+
+
+  json += "\"";
+
+
+  // GPS
+
+  json +=
+    ",\"gps\":" +
+    String(
+      gpsFix
+        ? "true"
+        : "false"
+    );
+
+
+  json +=
+    ",\"lat\":" +
+    String(
+      latitude,
+      6
+    );
+
+
+  json +=
+    ",\"lon\":" +
+    String(
+      longitude,
+      6
+    );
+
+
+  json +=
+    ",\"sat\":" +
+    String(
+      satellites
+    );
+
+
+  // MPU
+
+  json +=
+    ",\"dynamic\":" +
+    String(
+      dynamicAcceleration,
+      2
+    );
+
+
+  json +=
+    ",\"gyro\":" +
+    String(
+      gyroMagnitude,
+      1
+    );
+
+
+  // Accident
+
+  json +=
+    ",\"confidence\":" +
+    String(
+      crashConfidence,
+      0
+    );
+
+
+  json +=
+    ",\"local\":" +
+    String(
+      localAccident
+        ? "true"
+        : "false"
+    );
+
+
+  json +=
+    ",\"remote\":" +
+    String(
+      remoteAccident
+        ? "true"
+        : "false"
+    );
+
+
+  json +=
+    ",\"remoteNode\":" +
+    String(
+      remoteNode
+    );
+
+
+  json +=
+    ",\"remoteConfidence\":" +
+    String(
+      remoteConfidence,
+      0
+    );
+
+
+  // Nodes
+
+  json +=
+    ",\"nodes\":" +
+    String(
+      activeNodeCount()
+    );
+
+
+  // Stats
+
+  json +=
+    ",\"rx\":" +
+    String(
+      packetsRX
+    );
+
+
+  json +=
+    ",\"tx\":" +
+    String(
+      packetsTX
+    );
+
+
+  json +=
+    ",\"forwarded\":" +
+    String(
+      packetsForwarded
+    );
+
+
+  json +=
+    ",\"dropped\":" +
+    String(
+      packetsDropped
+    );
+
+
+  json +=
+    ",\"rssi\":" +
+    String(
+      lastRSSI
+    );
+
+
+  json +=
+    ",\"snr\":" +
+    String(
+      lastSNR,
+      1
+    );
+
+
+  String rx =
+    lastRX;
+
+
+  rx.replace(
+    "\"",
+    "\\\""
+  );
+
+
+  String tx =
+    lastTX;
+
+
+  tx.replace(
+    "\"",
+    "\\\""
+  );
+
+
+  json +=
+    ",\"received\":\"" +
+    rx +
+    "\"";
+
+
+  json +=
+    ",\"sent\":\"" +
+    tx +
+    "\"";
+
+
+  json +=
+    "}";
+
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+
+// ============================================================
+//                    TRANSPORT
+// ============================================================
+
+void handleTransport() {
+
+  if (
+    !server.hasArg(
+      "mode"
+    )
+  ) {
+
+    server.send(
+      400,
+      "text/plain",
+      "Missing mode"
+    );
+
+    return;
+  }
+
+
+  String mode =
+    server.arg(
+      "mode"
+    );
+
+
+  mode.toUpperCase();
+
+
+  if (
+    mode == "LORA"
+  ) {
+
+    transport =
+      MODE_LORA;
+
+
+    LoRa.receive();
+
+
     Serial.println(
-      "WARNING: MPU6050 unavailable"
+      "Transport = LoRa"
     );
   }
 
 
-  // =========================================================
-  // GPS
-  // =========================================================
+  else if (
+    mode == "BLE"
+  ) {
 
-  GPSSerial.begin(
-    GPS_BAUD,
-    SERIAL_8N1,
-    GPS_RX,
-    GPS_TX
+    transport =
+      MODE_BLE;
+
+
+    Serial.println(
+      "Transport = BLE"
+    );
+  }
+
+
+  else {
+
+    server.send(
+      400,
+      "text/plain",
+      "Invalid mode"
+    );
+
+    return;
+  }
+
+
+  server.send(
+    200,
+    "text/plain",
+    "OK"
+  );
+}
+
+
+// ============================================================
+//                    CAPTIVE PORTAL
+// ============================================================
+
+void handleRedirect() {
+
+  server.sendHeader(
+    "Location",
+    "http://192.168.4.1/",
+    true
   );
 
 
-  Serial.print(
-    "GPS baud: "
+  server.send(
+    302,
+    "text/plain",
+    ""
+  );
+}
+
+
+// ============================================================
+//                    WIFI
+// ============================================================
+
+void setupWiFi() {
+
+  WiFi.mode(
+    WIFI_AP
+  );
+
+
+  WiFi.softAP(
+    WIFI_NAME,
+    WIFI_PASSWORD
+  );
+
+
+  delay(500);
+
+
+  IPAddress ip =
+    WiFi.softAPIP();
+
+
+  Serial.println();
+  Serial.println(
+    "=============================="
   );
 
   Serial.println(
-    GPS_BAUD
+    "WIFI READY"
+  );
+
+  Serial.print(
+    "SSID: "
+  );
+
+  Serial.println(
+    WIFI_NAME
+  );
+
+  Serial.print(
+    "PASSWORD: "
+  );
+
+  Serial.println(
+    WIFI_PASSWORD
+  );
+
+  Serial.print(
+    "IP: "
+  );
+
+  Serial.println(
+    ip
   );
 
 
-  // =========================================================
-  // LORA
-  // =========================================================
+  // DNS wildcard
+
+  dnsServer.start(
+    DNS_PORT,
+    "*",
+    ip
+  );
+
+
+  // Dashboard
+
+  server.on(
+    "/",
+    handleRoot
+  );
+
+
+  server.on(
+    "/data",
+    handleData
+  );
+
+
+  server.on(
+    "/transport",
+    handleTransport
+  );
+
+
+  // Android
+
+  server.on(
+    "/generate_204",
+    handleRoot
+  );
+
+
+  server.on(
+    "/gen_204",
+    handleRoot
+  );
+
+
+  // Apple
+
+  server.on(
+    "/hotspot-detect.html",
+    handleRoot
+  );
+
+
+  // Windows
+
+  server.on(
+    "/connecttest.txt",
+    handleRoot
+  );
+
+
+  server.on(
+    "/ncsi.txt",
+    handleRoot
+  );
+
+
+  server.onNotFound(
+    handleRedirect
+  );
+
+
+  server.begin();
+
+
+  Serial.println(
+    "Captive portal started"
+  );
+}
+
+
+// ============================================================
+//                    SETUP LORA
+// ============================================================
+
+bool setupLoRa() {
 
   SPI.begin(
     LORA_SCK,
@@ -2380,163 +3057,203 @@ void setup() {
 
 
   Serial.println(
-    "Starting LoRa..."
+    "Starting SX1278..."
   );
 
 
   if (
     !LoRa.begin(
-      433E6
+      LORA_FREQUENCY
     )
   ) {
 
     Serial.println(
-      "LoRa FAILED!"
+      "❌ LORA FAILED"
     );
 
-  }
-
-  else {
-
-    Serial.println(
-      "LoRa OK!"
-    );
-
-
-    LoRa.setSpreadingFactor(
-      7
-    );
-
-
-    LoRa.setSignalBandwidth(
-      125E3
-    );
-
-
-    LoRa.setCodingRate4(
-      5
-    );
-
-
-    LoRa.setTxPower(
-      17
-    );
-
-
-    LoRa.enableCrc();
-
-
-    LoRa.receive();
+    return false;
   }
 
 
-  // =========================================================
+  Serial.println(
+    "✅ LORA OK"
+  );
+
+
+  LoRa.setSpreadingFactor(
+    LORA_SF
+  );
+
+
+  LoRa.setSignalBandwidth(
+    LORA_BW
+  );
+
+
+  LoRa.setCodingRate4(
+    LORA_CR
+  );
+
+
+  LoRa.setTxPower(
+    LORA_POWER
+  );
+
+
+  LoRa.enableCrc();
+
+
+  LoRa.receive();
+
+
+  return true;
+}
+
+
+// ============================================================
+//                    SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(
+    115200
+  );
+
+
+  delay(2500);
+
+
+  Serial.println();
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    "             ROAD MESH FINAL"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+#ifdef BOARD_C5
+
+  Serial.println(
+    "BOARD: ESP32-C5"
+  );
+
+#else
+
+  Serial.println(
+    "BOARD: NodeMCU ESP32"
+  );
+
+#endif
+
+
+  Serial.print(
+    "NODE ID: "
+  );
+
+  Serial.println(
+    NODE_ID
+  );
+
+
+  // ----------------------------------------------------------
+  // MPU
+  // ----------------------------------------------------------
+
+  mpuOK =
+    initMPU();
+
+
+  // ----------------------------------------------------------
+  // GPS
+  // ----------------------------------------------------------
+
+  GPSSerial.begin(
+    115200,
+    SERIAL_8N1,
+    GPS_RX,
+    GPS_TX
+  );
+
+
+  Serial.println(
+    "GPS UART started at 115200"
+  );
+
+
+  // ----------------------------------------------------------
+  // LORA
+  // ----------------------------------------------------------
+
+  setupLoRa();
+
+
+  // ----------------------------------------------------------
+  // BLE
+  // ----------------------------------------------------------
+
+  initBLE();
+
+
+  // ----------------------------------------------------------
   // WIFI
-  // =========================================================
+  // ----------------------------------------------------------
 
-  WiFi.mode(
-    WIFI_AP
-  );
+  setupWiFi();
 
 
-  bool wifiOK =
-    WiFi.softAP(
-      WIFI_NAME,
-      WIFI_PASSWORD
-    );
-
-
-  if (
-    wifiOK
-  ) {
-
-    Serial.println(
-      "WiFi AP started"
-    );
-
-
-    Serial.print(
-      "SSID: "
-    );
-
-    Serial.println(
-      WIFI_NAME
-    );
-
-
-    Serial.print(
-      "Password: "
-    );
-
-    Serial.println(
-      WIFI_PASSWORD
-    );
-
-
-    Serial.print(
-      "IP: "
-    );
-
-    Serial.println(
-      WiFi.softAPIP()
-    );
-
-  }
-
-  else {
-
-    Serial.println(
-      "WiFi AP FAILED"
-    );
-  }
-
-
-  // =========================================================
-  // WEB SERVER
-  // =========================================================
-
-  server.on(
-    "/",
-    handleRoot
-  );
-
-
-  server.on(
-    "/data",
-    handleData
-  );
-
-
-  server.begin();
-
-
+  Serial.println();
   Serial.println(
-    "Web server started"
-  );
-
-
-  Serial.println(
-    "========================================"
+    "=========================================="
   );
 
   Serial.println(
-    "          ROAD MESH READY"
+    "ROAD MESH READY"
   );
 
   Serial.println(
-    "========================================"
+    "=========================================="
+  );
+
+  Serial.println(
+    "Connect to WiFi: RoadMesh"
+  );
+
+  Serial.println(
+    "Password: roadmesh123"
+  );
+
+  Serial.println(
+    "Dashboard: http://192.168.4.1"
+  );
+
+  Serial.println(
+    "=========================================="
   );
 }
 
 
 // ============================================================
-// LOOP
+//                    LOOP
 // ============================================================
 
 void loop() {
 
   // ----------------------------------------------------------
-  // WEB SERVER
+  // Captive DNS
+  // ----------------------------------------------------------
+
+  dnsServer.processNextRequest();
+
+
+  // ----------------------------------------------------------
+  // Web server
   // ----------------------------------------------------------
 
   server.handleClient();
@@ -2550,16 +3267,13 @@ void loop() {
 
 
   // ----------------------------------------------------------
-  // SENSOR
+  // MPU
   // ----------------------------------------------------------
-
-  static unsigned long lastSensorRead =
-    0;
-
 
   if (
     millis() -
-    lastSensorRead >=
+    lastSensorRead
+    >=
     20
   ) {
 
@@ -2570,32 +3284,80 @@ void loop() {
     readMPU();
 
 
-    calculateCrashConfidence();
+    detectAccident();
   }
 
 
   // ----------------------------------------------------------
-  // LORA RECEIVE
-  // ----------------------------------------------------------
-
-  receiveLoRa();
-
-
-  // ----------------------------------------------------------
-  // HEARTBEAT
+  // LORA
   // ----------------------------------------------------------
 
   if (
-    millis() -
-    lastHeartbeat >=
-    HEARTBEAT_INTERVAL
+    transport
+    ==
+    MODE_LORA
   ) {
 
-    lastHeartbeat =
-      millis();
+    receiveLoRa();
 
 
-    sendHeartbeat();
+    if (
+      millis() -
+      lastHeartbeat
+      >=
+      HEARTBEAT_INTERVAL
+    ) {
+
+      lastHeartbeat =
+        millis();
+
+
+      sendHeartbeat();
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // BLE
+  // ----------------------------------------------------------
+
+  if (
+    transport
+    ==
+    MODE_BLE
+  ) {
+
+    if (
+      millis() -
+      lastBLEScan
+      >=
+      5000
+    ) {
+
+      lastBLEScan =
+        millis();
+
+
+      scanBLE();
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // Remote alert timeout
+  // ----------------------------------------------------------
+
+  if (
+    remoteAccident
+    &&
+    millis() -
+    remoteAlertTime
+    >
+    30000
+  ) {
+
+    remoteAccident =
+      false;
   }
 
 
