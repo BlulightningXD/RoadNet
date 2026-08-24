@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RoadNet | Safety Telemetry</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="/styles.css">
+</head><body>
+  <header>
+    <div class="brand"><span>◇</span> ROADMESH <small>SAFETY TELEMETRY</small></div>
+    <div class="controls">
+      <button id="bleConnect" class="btn-ble">⚡ Connect ESP32</button>
+      <button id="btnResetAccident" class="btn-reset-accident" style="display:none;">🔄 Reset Accident</button>
+      <label>Mode <select id="mode"><option value="ble">Web Bluetooth (Direct ESP32/C5)</option><option value="serial">Virtual COM Port (Classic)</option><option value="demo">Demo simulator</option></select></label>
+      <label id="portLabel" style="display:none;">COM Port <input id="port" value="COM7" placeholder="e.g. COM7"></label>
+      <button id="connect">Connect</button>
+    </div>
+    <div id="connection" class="status"><i></i> READY</div>
+  </header>
+
+  <div id="remoteBanner" class="remote-banner hidden">
+    <span>🚨 <b>REMOTE ACCIDENT ALERT:</b> Peer Node <b id="remoteNodeId">#--</b> reported crash (<b id="remoteConfVal">--%</b> confidence)</span>
+  </div>
+
+  <main>
+    <section class="map-card card">
+      <div class="card-title">LIVE VEHICLE POSITION <span id="coordinates">Signal not found</span></div>
+      <div id="gpsWarning" class="gps-warning hidden">
+        <span>⚠ Signal not found</span>
+        <small>GPS module searching for satellites / offline</small>
+      </div>
+      <div id="map"></div>
+    </section>
+
+    <section class="telemetry card">
+      <div class="card-title">INERTIAL TELEMETRY <span id="frameCount">0 frames</span></div>
+      <div class="charts">
+        <div><h3>ACCELERATION <em>g</em></h3><canvas id="accel"></canvas></div>
+        <div><h3>GYROSCOPE <em>°/s</em></h3><canvas id="gyro"></canvas></div>
+      </div>
+    </section>
+
+    <section class="health card">
+      <div class="card-title">MESH & SAFETY STATUS</div>
+      <div class="metrics">
+        <div><b id="nodes">0</b><span>ACTIVE NODES</span></div>
+        <div><b id="speed">0</b><span>KM/H</span></div>
+        <div><b id="airbag">ARMED</b><span>AIRBAG</span></div>
+      </div>
+      <div class="confidence">
+        <span>CRASH CONFIDENCE</span><strong id="confidenceText">0%</strong>
+        <div><i id="confidenceBar"></i></div>
+      </div>
+      <p id="event">Monitoring normal vehicle movement.</p>
+    </section>
+
+    <section class="network card">
+      <div class="card-title">LORA MESH STATISTICS <span id="loraTransport">LORA 433 MHz</span></div>
+      <div class="net-grid">
+        <div><span>NODE ID</span><b id="selfNode">#2</b></div>
+        <div><span>GPS FIX</span><b id="gpsFixText">● FIX</b></div>
+        <div><span>PACKETS RX/TX</span><b id="netPkts">0 / 0</b></div>
+        <div><span>FORWARDED</span><b id="netFwd">0</b></div>
+        <div><span>RSSI / SNR</span><b id="netRssi">0 dBm</b></div>
+        <div><span>LAST PACKET</span><b id="netLast" class="mono-truncate">—</b></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="alert" class="hidden">
+    <div>
+      <button id="dismiss">×</button>
+      <h2>⚠ LOCAL COLLISION DETECTED</h2>
+      <p>High-confidence impact telemetry was detected locally.</p>
+      <dl>
+        <dt>Coordinates</dt><dd id="alertCoords">—</dd>
+        <dt>Dynamic Impact</dt><dd id="alertImpact">—</dd>
+        <dt>Airbag Status</dt><dd id="alertAirbag">—</dd>
+      </dl>
+      <div style="margin-top:14px;display:flex;gap:10px;">
+        <button id="modalResetAccident" style="background:#ff5e67;color:#fff;padding:8px 16px;border-radius:4px;border:none;font-weight:bold;cursor:pointer;">🔄 Reset Accident (BLE)</button>
+        <button id="modalClose" style="background:#172536;color:#edf5ff;padding:8px 14px;border-radius:4px;border:1px solid #31445a;cursor:pointer;">Dismiss</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/bluetooth.js"></script>
+  <script src="/app.js"></script>
+</body></html>
